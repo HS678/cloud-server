@@ -12,9 +12,13 @@ import threading
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator
+from sqlalchemy import BigInteger, DateTime, String, select, text as sql_text
+from sqlalchemy.orm import Mapped, Session, mapped_column
+
+from app.database import Base, get_db
 
 SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 SHA256_CHECKSUM = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
@@ -31,8 +35,8 @@ class MapUploadRequest(BaseModel):
 
     product_type: str = Field(alias="productType", min_length=1)
     device_id: str = Field(alias="deviceId", min_length=1)
-    map_id: StrictInt = Field(alias="mapId", ge=0)
-    map_version: StrictInt = Field(alias="mapVersion", ge=0)
+    map_id: StrictInt = Field(alias="mapId", ge=0, le=4294967295)
+    map_version: StrictInt = Field(alias="mapVersion", ge=0, le=4294967295)
     map_name: str | None = Field(default=None, alias="mapName")
     checksum: str
     file_size_bytes: StrictInt = Field(alias="fileSizeBytes", ge=0)
@@ -53,12 +57,37 @@ class MapUploadRequest(BaseModel):
         return value.lower()
 
 
-class MapUploadResponse(BaseModel):
+class MapArtifact(Base):
+    __tablename__ = "map_artifacts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    product_type: Mapped[str] = mapped_column(String(64))
+    device_id: Mapped[str] = mapped_column(String(64))
+    map_id: Mapped[int] = mapped_column(BigInteger)
+    map_version: Mapped[int] = mapped_column(BigInteger)
+    map_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    checksum: Mapped[str] = mapped_column(String(71))
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger)
+    storage_key: Mapped[str] = mapped_column(String(1024))
+    status: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+
+
+class MapArtifactResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    map_json_url: str = Field(alias="mapJsonUrl")
-    file_size_bytes: int = Field(alias="fileSizeBytes")
+    product_type: str = Field(alias="productType")
+    device_id: str = Field(alias="deviceId")
+    map_id: int = Field(alias="mapId")
+    map_version: int = Field(alias="mapVersion")
     checksum: str
+    file_size_bytes: int = Field(alias="fileSizeBytes")
+    status: str
+
+
+class MapUploadResponse(BaseModel):
+    result: str
+    artifact: MapArtifactResponse
 
 
 def _skip_whitespace(raw: bytes, index: int) -> int:
@@ -198,62 +227,198 @@ def _validate_map_identity(body: MapUploadRequest) -> None:
         raise HTTPException(status_code=400, detail="outer and inner map ID/version do not match")
 
 
-def _response(body: MapUploadRequest, size: int, checksum: str) -> MapUploadResponse:
-    base_url = os.environ["MAP_PUBLIC_BASE_URL"].rstrip("/")
-    relative_url = (
-        f"maps/{body.product_type}/{body.device_id}/"
-        f"map_{body.map_id}_v{body.map_version}.json"
-    )
+def _response(
+    body: MapUploadRequest,
+    size: int,
+    checksum: str,
+    result: str,
+) -> MapUploadResponse:
     return MapUploadResponse(
-        mapJsonUrl=f"{base_url}/{relative_url}",
-        fileSizeBytes=size,
-        checksum=checksum,
+        result=result,
+        artifact=MapArtifactResponse(
+            productType=body.product_type,
+            deviceId=body.device_id,
+            mapId=body.map_id,
+            mapVersion=body.map_version,
+            checksum=checksum,
+            fileSizeBytes=size,
+            status="READY",
+        ),
     )
 
 
-@router.post("/upload", response_model=MapUploadResponse, response_model_by_alias=True)
+def _storage_key(body: MapUploadRequest) -> str:
+    return (
+        f"{body.product_type}/{body.device_id}/"
+        f"{body.map_id}/{body.map_version}/map.json"
+    )
+
+
+def _require_known_device(
+    db: Session,
+    product_type: str,
+    device_id: str,
+) -> None:
+    row = db.execute(
+        sql_text(
+            """
+            SELECT 1
+            FROM devices
+            WHERE device_id = :device_id
+              AND product_type = :product_type
+            """
+        ),
+        {
+            "device_id": device_id,
+            "product_type": product_type,
+        },
+    ).first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "robot is not allowed to upload for this device",
+                    "retryable": False,
+                }
+            },
+        )
+
+
+@router.post(
+    "/upload",
+    response_model=MapUploadResponse,
+    response_model_by_alias=True,
+)
 async def upload_map(
     request: Request,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
     _: Annotated[None, Depends(require_upload_token)],
 ) -> MapUploadResponse:
-    payload, content = extract_map_content(await request.body())
+    raw_body = await request.body()
+
+    if len(raw_body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "error": {
+                    "code": "PAYLOAD_TOO_LARGE",
+                    "message": "map upload exceeds maximum request size",
+                    "retryable": False,
+                }
+            },
+        )
+
+    payload, content = extract_map_content(raw_body)
+
     try:
         body = MapUploadRequest.model_validate(payload)
     except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=exc.errors(include_context=False)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "invalid map upload request",
+                    "retryable": False,
+                    "details": exc.errors(include_context=False),
+                }
+            },
+        ) from exc
+
+    _require_known_device(
+        db,
+        body.product_type,
+        body.device_id,
+    )
 
     _validate_map_identity(body)
+
     actual_size = len(content)
     actual_checksum = f"sha256:{hashlib.sha256(content).hexdigest()}"
+
     if body.file_size_bytes != actual_size:
-        raise HTTPException(status_code=400, detail="fileSizeBytes does not match original map bytes")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "MAP_CHECKSUM_MISMATCH",
+                    "message": "fileSizeBytes does not match original map bytes",
+                    "retryable": False,
+                }
+            },
+        )
+
     if not hmac.compare_digest(body.checksum, actual_checksum):
-        raise HTTPException(status_code=400, detail="checksum does not match original map bytes")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "MAP_CHECKSUM_MISMATCH",
+                    "message": "checksum does not match original map bytes",
+                    "retryable": False,
+                }
+            },
+        )
+
+    existing = db.scalar(
+        select(MapArtifact).where(
+            MapArtifact.product_type == body.product_type,
+            MapArtifact.device_id == body.device_id,
+            MapArtifact.map_id == body.map_id,
+            MapArtifact.map_version == body.map_version,
+        )
+    )
+
+    if existing is not None:
+        if not hmac.compare_digest(existing.checksum, actual_checksum):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "MAP_VERSION_CONFLICT",
+                        "message": "mapId/mapVersion exists with a different checksum",
+                        "retryable": False,
+                    }
+                },
+            )
+
+        response.status_code = status.HTTP_200_OK
+        return _response(
+            body,
+            existing.file_size_bytes,
+            existing.checksum,
+            "already_exists",
+        )
 
     root = Path(os.getenv("MAP_STATIC_ROOT", DEFAULT_STATIC_ROOT))
-    destination = (
-        root
-        / body.product_type
-        / body.device_id
-        / f"map_{body.map_id}_v{body.map_version}.json"
-    )
+    storage_key = _storage_key(body)
+    destination = root / storage_key
     temp_path: Path | None = None
+    destination_created = False
+
     try:
         with _write_lock:
             if destination.exists():
-                existing = destination.read_bytes()
-                existing_checksum = f"sha256:{hashlib.sha256(existing).hexdigest()}"
-                if not hmac.compare_digest(existing_checksum, actual_checksum):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="map ID/version already exists with different content",
-                    )
-                return _response(body, len(existing), existing_checksum)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail={
+                        "error": {
+                            "code": "MAP_STORAGE_ERROR",
+                            "message": "map storage contains an untracked version",
+                            "retryable": False,
+                        }
+                    },
+                )
 
             destination.parent.mkdir(parents=True, exist_ok=True)
+
             with tempfile.NamedTemporaryFile(
                 mode="wb",
-                prefix=f".{destination.name}.",
+                prefix=".map.",
                 suffix=".tmp",
                 dir=destination.parent,
                 delete=False,
@@ -262,12 +427,48 @@ async def upload_map(
                 temp_file.write(content)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
+
             os.replace(temp_path, destination)
             temp_path = None
+            destination_created = True
+
+            artifact = MapArtifact(
+                product_type=body.product_type,
+                device_id=body.device_id,
+                map_id=body.map_id,
+                map_version=body.map_version,
+                map_name=body.map_name,
+                checksum=actual_checksum,
+                file_size_bytes=actual_size,
+                storage_key=storage_key,
+                status="READY",
+            )
+
+            db.add(artifact)
+
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                if destination_created:
+                    destination.unlink(missing_ok=True)
+                    destination_created = False
+                raise
+
     except HTTPException:
         raise
     except OSError as exc:
-        raise HTTPException(status_code=500, detail="failed to persist map") from exc
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "code": "MAP_STORAGE_ERROR",
+                    "message": "failed to persist map",
+                    "retryable": True,
+                }
+            },
+        ) from exc
     finally:
         if temp_path is not None:
             try:
@@ -275,4 +476,11 @@ async def upload_map(
             except OSError:
                 pass
 
-    return _response(body, actual_size, actual_checksum)
+    response.status_code = status.HTTP_201_CREATED
+
+    return _response(
+        body,
+        actual_size,
+        actual_checksum,
+        "created",
+    )

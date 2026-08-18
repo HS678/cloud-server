@@ -399,6 +399,26 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if (
+        request.url.path.startswith("/api/maps/")
+        and isinstance(exc.detail, dict)
+        and "error" in exc.detail
+    ):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=jsonable_encoder(exc.detail),
+            headers=exc.headers,
+        )
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": jsonable_encoder(exc.detail)},
+        headers=exc.headers,
+    )
+
+
 app.include_router(map_upload_router)
 
 app.add_middleware(
