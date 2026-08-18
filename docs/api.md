@@ -70,6 +70,110 @@ GET /api/devices
 - operator
 - viewer
 
+## Map V2 - Robot
+
+### POST /api/maps/upload
+
+Robot 上传不可变地图版本。
+
+认证：
+
+- 当前联调阶段使用 MAP_UPLOAD_TOKEN
+
+请求核心字段：
+
+- productType
+- deviceId
+- mapId
+- mapVersion
+- mapName
+- checksum
+- fileSizeBytes
+- map
+
+规则：
+
+- mapId/mapVersion 必须在 uint32 范围内
+- map 内 map_id/version 必须与外层一致
+- checksum 和 fileSizeBytes 按 map 原始 JSON 字节计算
+- 上传成功不会改变 current map
+- 同 identity + 同 checksum 返回 already_exists
+- 同 identity + 不同 checksum 返回 MAP_VERSION_CONFLICT
+
+### PUT /api/devices/{productType}/{deviceId}/active-map
+
+Robot 上报当前实际使用地图。
+
+请求核心字段：
+
+- requestId
+- mapId
+- mapVersion
+- checksum
+
+行为：
+
+- 首次激活：result=activated
+- 同一地图新 requestId：result=already_active
+- 同 requestId 同 payload：返回原始幂等结果
+- 同 requestId 不同 payload：IDEMPOTENCY_CONFLICT
+- 仅实际切换地图时 activeRevision +1
+
+## Map V2 - APP
+
+### GET /api/devices/{productType}/{deviceId}/maps/current
+
+返回当前设备 active map。
+
+认证：
+
+- APP Access Token
+
+响应包含：
+
+- productType
+- deviceId
+- activeRevision
+- activeMap
+- activatedAt
+- lastReportedAt
+
+缓存：
+
+Cache-Control: no-store
+
+### GET /api/devices/{productType}/{deviceId}/maps/{mapId}/versions/{mapVersion}
+
+返回指定地图版本 metadata。
+
+字段：
+
+- mapId
+- mapVersion
+- mapName
+- checksum
+- fileSizeBytes
+- status
+- contentUrl
+
+### GET /api/devices/{productType}/{deviceId}/maps/{mapId}/versions/{mapVersion}/content
+
+返回 Robot 原始上传的 map JSON 字节。
+
+响应：
+
+- Content-Type: application/json
+- ETag: "sha256:..."
+- Cache-Control: private, max-age=31536000, immutable
+
+支持：
+
+If-None-Match
+
+匹配时：
+
+HTTP 304 Not Modified
+
 ## Jobs
 
 GET /api/jobs?device_id=<device_id>
