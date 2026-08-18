@@ -1,0 +1,22 @@
+services:
+  emqx:
+    image: emqx/emqx:5.8.6
+    container_name: robot-emqx
+    hostname: robot-emqx
+    restart: unless-stopped
+    environment:
+      EMQX_NODE__NAME: emqx@robot-emqx
+      EMQX_NODE__COOKIE: ${EMQX_NODE_COOKIE}
+    ports:
+      - "1883:1883"
+      - "18083:18083"
+    volumes:
+      - /opt/cloud-server/data/emqx:/opt/emqx/data
+      - /opt/cloud-server/logs/emqx:/opt/emqx/log
+    networks:
+      - robot-network
+
+networks:
+  robot-network:
+    name: robot-network
+    external: true
