@@ -8,13 +8,14 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -24,6 +25,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base, SessionLocal, get_db
+from app.map_upload import DeviceActiveMap, MapArtifact
 from app.map_upload import device_router as map_device_router
 from app.map_upload import router as map_upload_router
 
@@ -813,4 +815,273 @@ def update_wifi_config(
         device_id=device.device_id,
         ssid=device.wifi_ssid,
         configured=True,
+    )
+
+def require_map_device_access(
+    db: Session,
+    user_id: int,
+    product_type: str,
+    device_id: str,
+) -> tuple[Device, UserDeviceBinding]:
+    device, binding = require_device_access(
+        db,
+        user_id,
+        device_id,
+    )
+
+    if device.product_type != product_type:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_FOUND",
+                    "message": "device product type does not match",
+                    "retryable": False,
+                }
+            },
+        )
+
+    return device, binding
+
+
+def map_content_url(
+    product_type: str,
+    device_id: str,
+    map_id: int,
+    map_version: int,
+) -> str:
+    return (
+        f"/api/devices/{product_type}/{device_id}/"
+        f"maps/{map_id}/versions/{map_version}/content"
+    )
+
+
+@app.get(
+    "/api/devices/{product_type}/{device_id}/maps/current"
+)
+def get_current_map(
+    product_type: str,
+    device_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    require_map_device_access(
+        db,
+        user.id,
+        product_type,
+        device_id,
+    )
+
+    active = db.scalar(
+        select(DeviceActiveMap).where(
+            DeviceActiveMap.product_type == product_type,
+            DeviceActiveMap.device_id == device_id,
+        )
+    )
+
+    if active is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "ACTIVE_MAP_NOT_SET",
+                    "message": "device has no active map",
+                    "retryable": True,
+                }
+            },
+        )
+
+    artifact = db.get(MapArtifact, active.artifact_id)
+
+    if artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_READY",
+                    "message": "active map artifact is unavailable",
+                    "retryable": True,
+                }
+            },
+        )
+
+    if artifact.status != "READY":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_READY",
+                    "message": "active map artifact is not ready",
+                    "retryable": True,
+                }
+            },
+        )
+
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "productType": product_type,
+                "deviceId": device_id,
+                "activeRevision": active.active_revision,
+                "activeMap": {
+                    "mapId": artifact.map_id,
+                    "mapVersion": artifact.map_version,
+                    "mapName": artifact.map_name,
+                    "checksum": artifact.checksum,
+                    "fileSizeBytes": artifact.file_size_bytes,
+                    "contentUrl": map_content_url(
+                        product_type,
+                        device_id,
+                        artifact.map_id,
+                        artifact.map_version,
+                    ),
+                },
+                "activatedAt": active.activated_at,
+                "lastReportedAt": active.last_reported_at,
+            }
+        ),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get(
+    "/api/devices/{product_type}/{device_id}/"
+    "maps/{map_id}/versions/{map_version}"
+)
+def get_map_version(
+    product_type: str,
+    device_id: str,
+    map_id: int,
+    map_version: int,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    require_map_device_access(
+        db,
+        user.id,
+        product_type,
+        device_id,
+    )
+
+    artifact = db.scalar(
+        select(MapArtifact).where(
+            MapArtifact.product_type == product_type,
+            MapArtifact.device_id == device_id,
+            MapArtifact.map_id == map_id,
+            MapArtifact.map_version == map_version,
+        )
+    )
+
+    if artifact is None or artifact.status != "READY":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_FOUND",
+                    "message": "map version does not exist",
+                    "retryable": False,
+                }
+            },
+        )
+
+    return {
+        "productType": product_type,
+        "deviceId": device_id,
+        "mapId": artifact.map_id,
+        "mapVersion": artifact.map_version,
+        "mapName": artifact.map_name,
+        "checksum": artifact.checksum,
+        "fileSizeBytes": artifact.file_size_bytes,
+        "status": artifact.status,
+        "contentUrl": map_content_url(
+            product_type,
+            device_id,
+            artifact.map_id,
+            artifact.map_version,
+        ),
+    }
+
+
+@app.get(
+    "/api/devices/{product_type}/{device_id}/"
+    "maps/{map_id}/versions/{map_version}/content"
+)
+def get_map_content(
+    product_type: str,
+    device_id: str,
+    map_id: int,
+    map_version: int,
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    require_map_device_access(
+        db,
+        user.id,
+        product_type,
+        device_id,
+    )
+
+    artifact = db.scalar(
+        select(MapArtifact).where(
+            MapArtifact.product_type == product_type,
+            MapArtifact.device_id == device_id,
+            MapArtifact.map_id == map_id,
+            MapArtifact.map_version == map_version,
+        )
+    )
+
+    if artifact is None or artifact.status != "READY":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_FOUND",
+                    "message": "map version does not exist",
+                    "retryable": False,
+                }
+            },
+        )
+
+    etag = f'"{artifact.checksum}"'
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=31536000, immutable",
+            },
+        )
+
+    storage_root = Path(
+        os.getenv(
+            "MAP_STATIC_ROOT",
+            "/opt/cloud-server/storage/maps",
+        )
+    )
+
+    content_path = storage_root / artifact.storage_key
+
+    try:
+        content = content_path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "code": "MAP_STORAGE_ERROR",
+                    "message": "map content cannot be read",
+                    "retryable": True,
+                }
+            },
+        ) from exc
+
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=31536000, immutable",
+        },
     )
