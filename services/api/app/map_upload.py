@@ -71,7 +71,10 @@ class MapArtifact(Base):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger)
     storage_key: Mapped[str] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(32))
-    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[Any] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class DeviceActiveMap(Base):
@@ -99,7 +102,10 @@ class MapActivationRequest(Base):
     result: Mapped[str] = mapped_column(String(32))
     active_revision: Mapped[int] = mapped_column(BigInteger)
     activated_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[Any] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class MapActivationBody(BaseModel):
