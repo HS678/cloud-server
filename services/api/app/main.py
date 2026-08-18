@@ -24,7 +24,7 @@ from pydantic_settings import BaseSettings
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
-from app.database import Base, SessionLocal, get_db
+from app.database import Base, SessionLocal, engine, get_db
 from app.map_upload import DeviceActiveMap, MapArtifact
 from app.map_upload import device_router as map_device_router
 from app.map_upload import router as map_upload_router
