@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -71,6 +72,68 @@ class MapArtifact(Base):
     storage_key: Mapped[str] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+
+
+class DeviceActiveMap(Base):
+    __tablename__ = "device_active_maps"
+
+    product_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    artifact_id: Mapped[int] = mapped_column(BigInteger)
+    active_revision: Mapped[int] = mapped_column(BigInteger)
+    activation_request_id: Mapped[str] = mapped_column(String(255))
+    activated_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+    last_reported_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+
+
+class MapActivationRequest(Base):
+    __tablename__ = "map_activation_requests"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    product_type: Mapped[str] = mapped_column(String(64))
+    device_id: Mapped[str] = mapped_column(String(64))
+    request_id: Mapped[str] = mapped_column(String(255))
+    map_id: Mapped[int] = mapped_column(BigInteger)
+    map_version: Mapped[int] = mapped_column(BigInteger)
+    checksum: Mapped[str] = mapped_column(String(71))
+    result: Mapped[str] = mapped_column(String(32))
+    active_revision: Mapped[int] = mapped_column(BigInteger)
+    activated_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[Any] = mapped_column(DateTime(timezone=True))
+
+
+class MapActivationBody(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    request_id: str = Field(alias="requestId", min_length=1, max_length=255)
+    map_id: StrictInt = Field(alias="mapId", ge=0, le=4294967295)
+    map_version: StrictInt = Field(alias="mapVersion", ge=0, le=4294967295)
+    checksum: str
+
+    @field_validator("checksum")
+    @classmethod
+    def validate_activation_checksum(cls, value: str) -> str:
+        if not SHA256_CHECKSUM.fullmatch(value):
+            raise ValueError("must use sha256:<64 hexadecimal characters>")
+        return value.lower()
+
+
+class ActiveMapResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    map_id: int = Field(alias="mapId")
+    map_version: int = Field(alias="mapVersion")
+    checksum: str
+
+
+class MapActivationResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    result: str
+    device_id: str = Field(alias="deviceId")
+    active_revision: int = Field(alias="activeRevision")
+    active_map: ActiveMapResponse = Field(alias="activeMap")
+    activated_at: datetime = Field(alias="activatedAt")
 
 
 class MapArtifactResponse(BaseModel):
@@ -483,4 +546,201 @@ async def upload_map(
         actual_size,
         actual_checksum,
         "created",
+    )
+
+device_router = APIRouter(prefix="/api/devices", tags=["maps"])
+
+
+def _activation_response(
+    *,
+    result: str,
+    device_id: str,
+    active_revision: int,
+    map_id: int,
+    map_version: int,
+    checksum: str,
+    activated_at: datetime,
+) -> MapActivationResponse:
+    return MapActivationResponse(
+        result=result,
+        deviceId=device_id,
+        activeRevision=active_revision,
+        activeMap=ActiveMapResponse(
+            mapId=map_id,
+            mapVersion=map_version,
+            checksum=checksum,
+        ),
+        activatedAt=activated_at,
+    )
+
+
+@device_router.put(
+    "/{product_type}/{device_id}/active-map",
+    response_model=MapActivationResponse,
+    response_model_by_alias=True,
+)
+def activate_map(
+    product_type: str,
+    device_id: str,
+    body: MapActivationBody,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_upload_token)],
+) -> MapActivationResponse:
+    _require_known_device(db, product_type, device_id)
+
+    previous_request = db.scalar(
+        select(MapActivationRequest).where(
+            MapActivationRequest.product_type == product_type,
+            MapActivationRequest.device_id == device_id,
+            MapActivationRequest.request_id == body.request_id,
+        )
+    )
+
+    if previous_request is not None:
+        same_payload = (
+            previous_request.map_id == body.map_id
+            and previous_request.map_version == body.map_version
+            and hmac.compare_digest(previous_request.checksum, body.checksum)
+        )
+
+        if not same_payload:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "IDEMPOTENCY_CONFLICT",
+                        "message": "requestId was already used with different content",
+                        "retryable": False,
+                    }
+                },
+            )
+
+        return _activation_response(
+            result=previous_request.result,
+            device_id=device_id,
+            active_revision=previous_request.active_revision,
+            map_id=previous_request.map_id,
+            map_version=previous_request.map_version,
+            checksum=previous_request.checksum,
+            activated_at=previous_request.activated_at,
+        )
+
+    artifact = db.scalar(
+        select(MapArtifact).where(
+            MapArtifact.product_type == product_type,
+            MapArtifact.device_id == device_id,
+            MapArtifact.map_id == body.map_id,
+            MapArtifact.map_version == body.map_version,
+        )
+    )
+
+    if artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_FOUND",
+                    "message": "map artifact does not exist",
+                    "retryable": False,
+                }
+            },
+        )
+
+    if artifact.status != "READY":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": {
+                    "code": "MAP_NOT_READY",
+                    "message": "map artifact is not ready",
+                    "retryable": True,
+                }
+            },
+        )
+
+    if not hmac.compare_digest(artifact.checksum, body.checksum):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": {
+                    "code": "MAP_CHECKSUM_MISMATCH",
+                    "message": "activation checksum does not match stored artifact",
+                    "retryable": False,
+                }
+            },
+        )
+
+    now = datetime.now(timezone.utc)
+
+    active = db.scalar(
+        select(DeviceActiveMap)
+        .where(
+            DeviceActiveMap.product_type == product_type,
+            DeviceActiveMap.device_id == device_id,
+        )
+        .with_for_update()
+    )
+
+    if active is None:
+        result = "activated"
+        active_revision = 1
+        activated_at = now
+
+        active = DeviceActiveMap(
+            product_type=product_type,
+            device_id=device_id,
+            artifact_id=artifact.id,
+            active_revision=active_revision,
+            activation_request_id=body.request_id,
+            activated_at=activated_at,
+            last_reported_at=now,
+        )
+        db.add(active)
+
+    elif active.artifact_id == artifact.id:
+        result = "already_active"
+        active_revision = active.active_revision
+        activated_at = active.activated_at
+        active.activation_request_id = body.request_id
+        active.last_reported_at = now
+
+    else:
+        result = "activated"
+        active.artifact_id = artifact.id
+        active.active_revision += 1
+        active.activation_request_id = body.request_id
+        active.activated_at = now
+        active.last_reported_at = now
+
+        active_revision = active.active_revision
+        activated_at = now
+
+    activation_request = MapActivationRequest(
+        product_type=product_type,
+        device_id=device_id,
+        request_id=body.request_id,
+        map_id=body.map_id,
+        map_version=body.map_version,
+        checksum=body.checksum,
+        result=result,
+        active_revision=active_revision,
+        activated_at=activated_at,
+    )
+
+    db.add(activation_request)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return _activation_response(
+        result=result,
+        device_id=device_id,
+        active_revision=active_revision,
+        map_id=body.map_id,
+        map_version=body.map_version,
+        checksum=body.checksum,
+        activated_at=activated_at,
     )

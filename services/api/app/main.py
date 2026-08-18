@@ -24,6 +24,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base, SessionLocal, get_db
+from app.map_upload import device_router as map_device_router
 from app.map_upload import router as map_upload_router
 
 ALGORITHM = "HS256"
@@ -402,7 +403,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if (
-        request.url.path.startswith("/api/maps/")
+        (
+            request.url.path.startswith("/api/maps/")
+            or "/maps/" in request.url.path
+            or request.url.path.endswith("/active-map")
+        )
         and isinstance(exc.detail, dict)
         and "error" in exc.detail
     ):
@@ -420,6 +425,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 app.include_router(map_upload_router)
+app.include_router(map_device_router)
 
 app.add_middleware(
     CORSMiddleware,
