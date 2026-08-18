@@ -20,9 +20,10 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import URL, DateTime, ForeignKey, Integer, String, Text, create_engine, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, select
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
+from app.database import Base, SessionLocal, get_db
 from app.map_upload import router as map_upload_router
 
 ALGORITHM = "HS256"
@@ -60,30 +61,11 @@ class Settings(BaseSettings):
     bootstrap_password: str = Field(alias="API_BOOTSTRAP_PASSWORD")
     public_host: str = Field(default="localhost", alias="PUBLIC_HOST")
 
-    def sqlalchemy_url(self) -> str | URL:
-        if self.database_url:
-            return self.database_url
-        return URL.create(
-            "postgresql+psycopg",
-            username=self.postgres_user,
-            password=self.postgres_password,
-            host=self.postgres_host,
-            port=self.postgres_port,
-            database=self.postgres_db,
-        )
 
 
 settings = Settings()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
-
-engine = create_engine(settings.sqlalchemy_url(), pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-
-class Base(DeclarativeBase):
-    pass
-
 
 class User(Base):
     __tablename__ = "users"
@@ -103,6 +85,7 @@ class Device(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     device_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    product_type: Mapped[str] = mapped_column(String(64))
     display_name: Mapped[str] = mapped_column(String(128))
     owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     wifi_ssid: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -237,14 +220,6 @@ class WifiConfigUpdate(BaseModel):
 class FirmwareUpgradeRequest(BaseModel):
     device_id: str
     target_version: str | None = None
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 def hash_password(password: str) -> str:
